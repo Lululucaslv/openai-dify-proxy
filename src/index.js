@@ -1,93 +1,85 @@
-// src/index.js
 import express from 'express';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
+
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-const DIFY_KEY = process.env.DIFY_API_KEY;
-if (!DIFY_KEY) {
-  console.error('请设置 DIFY_API_KEY');
+// Dify 配置
+const DIFY_API_URL = process.env.DIFY_API_URL || 'https://api.dify.ai/v1/chat-messages';
+const DIFY_API_KEY = process.env.DIFY_API_KEY;
+if (!DIFY_API_KEY) {
+  console.error('请在 .env 文件中设置 DIFY_API_KEY');
   process.exit(1);
 }
 
-app.post('/v1/chat/completions', async (req, res) => {
-  // 1. 转发给 Dify，开启 SSE
-  const upstream = await fetch('https://api.dify.ai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${DIFY_KEY}`,
-    },
-    body: JSON.stringify({ ...req.body, stream: true }),
-  });
+app.use(express.json());
 
-  if (!upstream.ok || !upstream.body) {
-    const text = await upstream.text();
-    return res.status(upstream.status).send(text);
-  }
+// 核心处理逻辑，兼容 SSE 和普通模式
+async function handleCompletion(req, res) {
+  try {
+    const { model, messages, stream, ...rest } = req.body;
+    // 把所有用户消息按行拼成一个 query
+    const query = (messages || []).map(m => m.content).join('\n');
+    const body = {
+      query,
+      inputs: {},                            // 如有自定义变量，可填在这里
+      user: rest.user || 'anonymous',
+      response_mode: stream ? 'streaming' : 'standard'
+    };
 
-  // 2. 设置响应头为 SSE
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.flushHeaders();
+    const upstream = await fetch(DIFY_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${DIFY_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
 
-  // 3. 逐行读取 Dify 的 SSE，转换后写给客户端
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buf = '';
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-
-    let lines = buf.split(/\r?\n/);
-    buf = lines.pop() || ''; // 最后一行可能不完整，留给下次
-
-    for (let line of lines) {
-      line = line.trim();
-      if (!line.startsWith('data:')) continue;
-
-      const jsonStr = line.slice(5).trim();
-      if (jsonStr === '[DONE]') {
-        // Dify 结束标记（如果有）
-        res.write(`data: [DONE]\n\n`);
-        break;
-      }
-
-      let evt;
-      try {
-        evt = JSON.parse(jsonStr);
-      } catch {
-        continue;
-      }
-
-      // 根据 Dify 的 payload 构造 OpenAI 的 delta
-      // Dify 每次 event.data.data.answer 里可能就是文本片段
-      const text = evt.data?.answer ?? '';
-      const delta = text ? { content: text } : {};
-
-      const chunk = {
-        choices: [{
-          delta,
-          index: 0,
-          finish_reason: null
-        }]
-      };
-
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    if (!upstream.ok) {
+      const text = await upstream.text();
+      return res.status(upstream.status).send(text);
     }
+
+    // SSE 流式返回
+    if (stream) {
+      res.set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      return upstream.body.pipe(res);
+    }
+
+    // 非流式返回 JSON
+    const data = await upstream.json();
+    const answer = data.outputs.answer ?? data.outputs.text ?? '';
+    res.json({
+      id: data.message_id,
+      object: 'chat.completion',
+      created: data.created_at,
+      model,
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: answer },
+        finish_reason: 'stop'
+      }]
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
   }
+}
 
-  // 4. 最后给一个 DONE
-  res.write('data: [DONE]\n\n');
-  res.end();
-});
+// 原路径：OpenAI 兼容接口
+app.post('/v1/chat/completions', handleCompletion);
 
-const port = process.env.PORT || 8080;
-app.listen(port, () => {
-  console.log(`Proxy 服务已启动，端口 ${port}`);
+// 兼容不带版本号的路径（Page Assist 默认发到 /chat/completions）
+app.post('/chat/completions', handleCompletion);
+
+app.listen(PORT, () => {
+  console.log(`Proxy 服务已启动，端口 ${PORT}`);
 });
